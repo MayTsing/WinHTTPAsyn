@@ -19,6 +19,7 @@ uses
 
 type
   THttpConnection = class;
+  THttpContext = class;
 
   TConnectParams = record
     Server: string;
@@ -35,23 +36,37 @@ type
   TWinHttpDownload = function(Sender: TObject; CurrentSize, ContentLength, ChunkSize: DWORD; const ChunkData): boolean of object;
   TWinHttpProgress = procedure(Sender: TObject; CurrentSize, ContentLength: DWORD) of object;
 
+  TResponseDataFun = reference to procedure(Sender: THttpContext; Code: DWORD);
+
+  TContextOptions = set of (coDisableZip,       // 不需要服务等压缩数据
+                            coDumpResponseData  // 丢弃返回值, 只要状态码
+                            );
+
   // HTTP 请求上下文
   THttpContext = class
   private
     FOwner: TObject;
+    FSender: TObject;
+    FOptions : TContextOptions;
+
     FRequestHandle: HINTERNET;
+
+    FAPI: string;
+    FMethod: string;
+    FIsHttps: boolean;
+
 
     FLastError: DWORD;
     FErrorMsg: string;
 
 
-    FMethod: string;
     FDownloadChunkSize: DWORD;
     FInData: RawByteString;
     FInDataLength: DWORD;
 
     FOnFinshed: TNotifyEvent;
-    FURL: string;
+    FResponseDataFun: TResponseDataFun;
+
     FBuffer: RawByteString;
     FBufferSize: DWORD;
     FResponseReadSize: DWORD;
@@ -65,7 +80,6 @@ type
     FEncoding :RawByteString;
     FOutDataLength: DWORD;
 
-    function  GetIsHttps: Boolean;
     function  InternalGetInfo(Info: DWORD): RawByteString;
     function  InternalGetInfo32(Info: DWORD): DWORD;
     function  GetOutDataLength: DWORD;
@@ -80,7 +94,6 @@ type
     procedure ConvertRequestBuffer;
     procedure PushBuffer(Buffer: Pointer; Size: DWORD);
     function  QueryData: boolean;
-    procedure QueryHeader;
     function  ReadData(Size: DWORD): Boolean;
 
     procedure DoSendRequestComplete(dwStatusInformationLength: DWORD);
@@ -88,6 +101,8 @@ type
     procedure DoDataAvailable(lpvStatusInformation: LPVOID);
     procedure DoReadComplete(lpvStatusInformation: LPVOID; dwStatusInformationLength: DWORD);
     procedure DoRequestError(lpvStatusInformation: LPWINHTTP_ASYNC_RESULT);
+    procedure DoResponseData;
+    function IsHttps: Boolean;
   public
     UserData: string;
 
@@ -96,17 +111,18 @@ type
 
     procedure SetInData(const AData: String);
     procedure CloseRequst;
+    function Request(AFun: TResponseDataFun = nil): Integer;
 
-    function Request: Integer;
-
-    property URL: string read FURL write FURL;
+    property API: string read FAPI write FAPI;
     property Method: string read FMethod write FMethod;
     property Owner: TObject read FOwner;
+    property Sender: TObject read FSender;
+
     property LastError: DWORD read FLastError write FLastError;
     property ErrorMsg: string read FErrorMsg write FErrorMsg;
+
     property DownloadChunkSize: DWORD read FDownloadChunkSize write FDownloadChunkSize;
     property InDataLength: DWORD read FInDataLength;
-    property IsHttps: Boolean read GetIsHttps;
     property ResponseLength: DWORD read GetOutDataLength;
     property RequestTickCount: Cardinal read FTickCount;
     property Code: DWORD read FCode;
@@ -127,7 +143,10 @@ type
   public
     constructor Create(AOwner: TObject; const AParams: TConnectParams); virtual;
     destructor Destroy; override;
-    function BuildContext(const API, AMethod: string): THttpContext; virtual;
+    function BuildContext(Sender: TObject; const API, AMethod: string):
+        THttpContext; virtual;
+    function Async(Sender: TObject; API, Method: string; AParams, AContext: string;
+        AFun: TResponseDataFun; AOptions: TContextOptions = []): Boolean;
   end;
 
   THttpConnectionClass = class of THttpConnection;
@@ -151,9 +170,8 @@ type
   public
     constructor Create(AOwner: TObject; const AParams: TConnectParams); override;
     destructor Destroy; override;
-    function BuildContext(const API, AMethod: string): THttpContext; override;
+    function BuildContext(Sender: TObject; const API, AMethod: string): THttpContext; override;
   end;
-
 
   function GetHttpConnecitonClass: THttpConnectionClass;
 
@@ -284,18 +302,33 @@ begin
   inherited;
 end;
 
-function THttpConnection.BuildContext(const API, AMethod: string):THttpContext;
+function THttpConnection.Async(Sender: TObject; API, Method: string; AParams,
+    AContext: string; AFun: TResponseDataFun; AOptions: TContextOptions = []):
+    Boolean;
+var
+  cContext: THttpContext;
+begin
+  cContext := BuildContext(Sender, API, Method);
+  cContext.SetInData(AParams);
+  cContext.UserData := AContext;
+  Result := cContext.Request(AFun) = ID_OK;
+end;
+
+function THttpConnection.BuildContext(Sender: TObject; const API, AMethod:
+    string): THttpContext;
 begin
   Result := nil;
 end;
 
 { TWinHttpConnection }
 
-function TWinHttpConnection.BuildContext(const API,
+function TWinHttpConnection.BuildContext(Sender: TObject; const API,
   AMethod: string): THttpContext;
 begin
   Result := THttpRequestContext.Create(Self);
-  Result.URL := API;
+  Result.FIsHttps := FParams.IsHttps;
+  Result.FSender := Sender;
+  Result.API := API;
   Result.Method := AMethod;
 end;
 
@@ -473,8 +506,7 @@ begin
     WinHttpAPI.CloseHandle(cReqHandle);
     FTickCount := GetTickCount - FTickCount;
 
-    if Assigned(FOnFinshed) then
-      FOnFinshed(Self);
+    DoResponseData;
 
     Free;
   end;
@@ -558,16 +590,6 @@ begin
   end;
 end;
 
-procedure THttpContext.QueryHeader;
-begin
-  FCode := InternalGetInfo32(WINHTTP_QUERY_STATUS_CODE);
-  //FHeader := InternalGetInfo(WINHTTP_QUERY_RAW_HEADERS_CRLF);
-  FEncoding := InternalGetInfo(WINHTTP_QUERY_CONTENT_ENCODING);
-  //FAcceptEncoding := InternalGetInfo(WINHTTP_QUERY_ACCEPT_ENCODING);
-  FOutDataLength := InternalGetInfo32(WINHTTP_QUERY_CONTENT_LENGTH);
-  //FContentType := InternalGetInfo(WINHTTP_QUERY_CONTENT_TYPE);
-end;
-
 function THttpContext.QueryData: boolean;
 begin
 	Result := WinHttpAPI.QueryDataAvailable(FRequestHandle, nil);
@@ -592,7 +614,7 @@ begin
     WriteLastRequestError;
 end;
 
-function THttpContext.Request: Integer;
+function THttpContext.Request(AFun: TResponseDataFun): Integer;
 const
   ALL_ACCEPT: array[0..1] of PWideChar = ('*/*',nil);
   IGNRECERTOPTS = SECURITY_FLAG_IGNORE_UNKNOWN_CA or
@@ -606,19 +628,20 @@ var
   iDataLen: DWORD;
   sHeader: String;
 begin
+  FResponseDataFun := AFun;
   Result := ERROR_WINHTTP_INVALID_URL;
-  if (URL = '') or (Method = '') then
+  if (API = '') or (Method = '') then
     Exit;
 
   FTickCount := GetTickCount;
   try
     // options for a true RESTful request
     iFlags := WINHTTP_FLAG_REFRESH;
-    if IsHttps then
+    if FIsHttps then
       iFlags := iFlags or WINHTTP_FLAG_SECURE;
 
     FRequestHandle := WinHttpAPI.OpenRequest(TWinHttpConnection(Owner).FConnection,
-                  PChar(Method), PChar(URL), nil, nil, @ALL_ACCEPT, iFlags);
+                  PChar(Method), PChar(API), nil, nil, @ALL_ACCEPT, iFlags);
     if not Assigned(FRequestHandle) then
       Exit;
 
@@ -639,6 +662,8 @@ begin
       if not SetOption(FRequestHandle, WINHTTP_OPTION_SECURITY_FLAGS, IGNRECERTOPTS) then
         Exit;
     end;
+
+
 
     sHeader := 'Accept-Encoding: gzip'#13#10'Content-Type: application/json; charset=utf-8';
 
@@ -696,12 +721,22 @@ end;
 
 procedure THttpContext.DoHeadersAvailable(dwStatusInformationLength: DWORD);
 begin
-	QueryHeader;
-
-	// 读取数据
-  if Code = HTTP_STATUS_OK then
+  FCode := InternalGetInfo32(WINHTTP_QUERY_STATUS_CODE);
+  if (FOptions * [coDumpResponseData] = []) then
   begin
-    if not QueryData then
+    //FHeader := InternalGetInfo(WINHTTP_QUERY_RAW_HEADERS_CRLF);
+    FEncoding := InternalGetInfo(WINHTTP_QUERY_CONTENT_ENCODING);
+    //FAcceptEncoding := InternalGetInfo(WINHTTP_QUERY_ACCEPT_ENCODING);
+    FOutDataLength := InternalGetInfo32(WINHTTP_QUERY_CONTENT_LENGTH);
+    //FContentType := InternalGetInfo(WINHTTP_QUERY_CONTENT_TYPE);
+
+    // 读取数据
+    if FCode = HTTP_STATUS_OK then
+    begin
+      if not QueryData then
+        CloseRequst;
+    end
+    else
       CloseRequst;
   end
   else
@@ -751,6 +786,14 @@ begin
   CloseRequst;
 end;
 
+procedure THttpContext.DoResponseData;
+begin
+  if assigned(FResponseDataFun) then
+    FResponseDataFun(Self, FCode);
+  if Assigned(FOnFinshed) then
+    FOnFinshed(Self);
+end;
+
 function THttpContext.GetOutDataLength: DWORD;
 begin
   Result := OutDataLength;
@@ -758,7 +801,7 @@ begin
     Result := FResponseReadSize;
 end;
 
-function THttpContext.GetIsHttps: Boolean;
+function THttpContext.IsHttps: Boolean;
 begin
   Result := TWinHttpConnection(Owner).FParams.IsHttps;
 end;
