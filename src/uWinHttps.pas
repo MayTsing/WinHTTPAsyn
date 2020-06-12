@@ -38,6 +38,7 @@ type
 
   TResponseDataFun = reference to procedure(Sender: THttpContext; Code: DWORD);
 
+
   TContextOptions = set of (coDisableZip,       // 不需要服务等压缩数据
                             coDumpResponseData  // 丢弃返回值, 只要状态码
                             );
@@ -47,45 +48,40 @@ type
   private
     FOwner: TObject;
     FSender: TObject;
-    FOptions : TContextOptions;
-
     FRequestHandle: HINTERNET;
 
     FAPI: string;
     FMethod: string;
     FIsHttps: boolean;
+    FOptions : TContextOptions;
 
-
-    FLastError: DWORD;
-    FErrorMsg: string;
-
-
-    FDownloadChunkSize: DWORD;
     FInData: RawByteString;
     FInDataLength: DWORD;
 
-    FOnFinshed: TNotifyEvent;
-    FResponseDataFun: TResponseDataFun;
-
     FBuffer: RawByteString;
     FBufferSize: DWORD;
-    FResponseReadSize: DWORD;
-    FResponseData: TStream;
-    // 过程状态名称
-    FTickCount: Cardinal;
-    OutDataLength: DWORD;
-
+    FDownloadChunkSize: DWORD;  // 下载代码块长度
     // response Data
     FCode: DWORD;
     FEncoding :RawByteString;
     FOutDataLength: DWORD;
+    FResponseData: TStream;
+    FResponseReadSize: DWORD;   // 读取总长度
+
+    // 最后的错误信息
+    FLastError: DWORD;
+    FErrorMsg: string;
+    FTickCount: Cardinal;       // 不精确的消耗计时
+
+    FOnFinshed: TNotifyEvent;
+    FResponseDataFun: TResponseDataFun;
 
     function  InternalGetInfo(Info: DWORD): RawByteString;
     function  InternalGetInfo32(Info: DWORD): DWORD;
     function  GetOutDataLength: DWORD;
-    function  SetOption(var ARequest: HINTERNET; AOpt, AFlags: DWORD): Boolean;
+    function  SetOption(AOpt, AFlags: DWORD): Boolean;
+    function  AddHeader(const Data: string): boolean;
     procedure WriteLastError;
-
   protected
     fOnDownload: TWinHttpDownload;
     fOnProgress: TWinHttpProgress;
@@ -147,6 +143,9 @@ type
         THttpContext; virtual;
     function Async(Sender: TObject; API, Method: string; AParams, AContext: string;
         AFun: TResponseDataFun; AOptions: TContextOptions = []): Boolean;
+    function Await(Sender: TObject; API, Method: string; AParams, AContext: string;
+        AFun: TResponseDataFun; AOptions: TContextOptions = []): Boolean;
+
   end;
 
   THttpConnectionClass = class of THttpConnection;
@@ -179,7 +178,21 @@ type
 implementation
 
 uses
-  uLogWriter, SynZip;
+  uLogWriter, SynZip, untCommFuns;
+
+type
+  TWorkThread = class(TThread)
+  private
+    FCallback: TResponseDataFun;
+    FFinished: Boolean;
+    FContext: THttpContext;
+    procedure DoCallbackFun;
+    function DoOnRequestFinished: TNotifyEvent;
+  protected
+    constructor Create(AContext: THttpContext; ACall: TResponseDataFun);
+    procedure Execute; override;
+  end;
+
 
 var
   OSVersionInfo: TOSVersionInfoEx;
@@ -308,10 +321,31 @@ function THttpConnection.Async(Sender: TObject; API, Method: string; AParams,
 var
   cContext: THttpContext;
 begin
+  // 异步处理请求
   cContext := BuildContext(Sender, API, Method);
   cContext.SetInData(AParams);
   cContext.UserData := AContext;
+  cContext.FOptions := AOptions;
   Result := cContext.Request(AFun) = ID_OK;
+end;
+
+function THttpConnection.Await(Sender: TObject; API, Method: string; AParams, AContext: string;
+    AFun: TResponseDataFun; AOptions: TContextOptions = []): Boolean;
+var
+  cContext: THttpContext;
+  cWorkThread: TWorkThread;
+begin
+  // 异步处理请求
+  cContext := BuildContext(Sender, API, Method);
+  cContext.SetInData(AParams);
+  cContext.UserData := AContext;
+  cContext.FOptions := AOptions;
+  cWorkThread := TWorkThread.Create(cContext, AFun);
+  cWorkThread.Start;
+  cWorkThread.WaitFor;
+  cWorkThread.Free;
+
+  Result := True;
 end;
 
 function THttpConnection.BuildContext(Sender: TObject; const API, AMethod:
@@ -659,18 +693,19 @@ begin
     // SSL ignore certificates
     if iFlags and WINHTTP_FLAG_SECURE = WINHTTP_FLAG_SECURE then
     begin
-      if not SetOption(FRequestHandle, WINHTTP_OPTION_SECURITY_FLAGS, IGNRECERTOPTS) then
+      if not SetOption(WINHTTP_OPTION_SECURITY_FLAGS, IGNRECERTOPTS) then
         Exit;
     end;
 
+    if FOptions * [coDisableZip] = [] then
+      if not AddHeader('Accept-Encoding: gzip') then
+        Exit;
+    if not AddHeader('Content-Type: application/json; charset=utf-8') then
+      Exit;
 
-
-    sHeader := 'Accept-Encoding: gzip'#13#10'Content-Type: application/json; charset=utf-8';
-
-    iDataLen := InDataLength;
-    if WinHttpAPI.SendRequest(FRequestHandle,
-            PChar(sHeader), length(sHeader),
-            Pointer(FInData), iDataLen, iDataLen, DWORD_PTR(Pointer(Self))) then
+    if WinHttpAPI.SendRequest(FRequestHandle, nil, 0,
+            Pointer(FInData), FInDataLength, FInDataLength,
+            DWORD_PTR(Pointer(Self))) then
       Result := S_OK;
 
   finally
@@ -796,7 +831,7 @@ end;
 
 function THttpContext.GetOutDataLength: DWORD;
 begin
-  Result := OutDataLength;
+  Result := FOutDataLength;
   if Result = 0 then
     Result := FResponseReadSize;
 end;
@@ -815,11 +850,21 @@ begin
     ErrorMsg := Format('Undefined %s error',[WinHttpDll]);
 end;
 
-function THttpContext.SetOption(var ARequest: HINTERNET; AOpt, AFlags: DWORD):
-    Boolean;
+function THttpContext.SetOption(AOpt, AFlags: DWORD): Boolean;
 begin
- Result := WinHttpAPI.SetOption(ARequest, AOpt, @AFlags, sizeOf(AFlags));
+ Result := WinHttpAPI.SetOption(FRequestHandle, AOpt, @AFlags, sizeOf(AFlags));
 end;
+
+function THttpContext.AddHeader(const Data: string): boolean;
+begin
+  Result := True;
+  if (Data<>'') then
+  begin
+    Result := WinHttpAPI.AddRequestHeaders(FRequestHandle, PChar(Data), length(Data),
+      WINHTTP_ADDREQ_FLAG_COALESCE);
+  end;
+end;
+
 
 { THttpRequestContext }
 
@@ -827,6 +872,41 @@ destructor THttpRequestContext.Destroy;
 begin
   TWinHttpConnection(Owner).InternetCloseHandle(FRequestHandle);
   inherited;
+end;
+
+constructor TWorkThread.Create(AContext: THttpContext; ACall: TResponseDataFun);
+begin
+  FContext := AContext;
+  FCallback := ACall;
+  inherited Create(True);
+end;
+
+procedure TWorkThread.DoCallbackFun;
+begin
+  if Assigned(FCallback) then
+    FCallback(FContext, FContext.Code);
+end;
+
+function TWorkThread.DoOnRequestFinished: TNotifyEvent;
+begin
+end;
+
+{ TWorkThread }
+
+procedure TWorkThread.Execute;
+begin
+  inherited;
+  FFinished := False;
+  FContext.Request(
+    procedure (Sender: THttpContext; Code: DWORD)
+    begin
+      Synchronize(DoCallbackFun);
+      FFinished := true;
+    end
+  );
+
+  while not FFinished do
+    Sleep(30);
 end;
 
 end.
