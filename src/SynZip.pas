@@ -1717,6 +1717,7 @@ begin
   pData := nil;
   if orig is TMemoryStream then
     pData := TMemoryStream(orig).Memory;
+
   iLen := integer(orig.Size);
 
   if gzr.Init(pData,iLen) then

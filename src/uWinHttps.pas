@@ -15,12 +15,14 @@ unit uWinHttps;
 interface
 
 uses
-  Classes, SysUtils, Windows, uWinHttpAPI;
+  Classes, SysUtils, Windows, uWinHttpAPI, uDataRequests;
 
 type
   THttpConnection = class;
   THttpContext = class;
+  TRequestHandle = Pointer;
 
+  PConnectParams = ^TConnectParams;
   TConnectParams = record
     Server: string;
     Port: Word;
@@ -30,14 +32,26 @@ type
     ConnectionTimeOut: DWORD;
     SendTimeout: DWORD;
     ReceiveTimeout: DWORD;
+    procedure Init(const ASvr: string; APort: word; AIsSSL: boolean);
+
+
   end;
 
   TWinHttpUpload = function(Sender: TObject; CurrentSize, ContentLength: DWORD): boolean of object;
   TWinHttpDownload = function(Sender: TObject; CurrentSize, ContentLength, ChunkSize: DWORD; const ChunkData): boolean of object;
   TWinHttpProgress = procedure(Sender: TObject; CurrentSize, ContentLength: DWORD) of object;
 
+
   TResponseDataFun = reference to procedure(Sender: THttpContext; Code: DWORD);
 
+  IResponseEvent = interface
+    ['{BF376E5D-B65F-4F7B-A659-2C66B1F6CF84}']
+    function GetIsActived: Boolean; stdcall;
+    procedure SetIsActived(const Value: Boolean); stdcall;
+    procedure Load(Sender: THttpContext; Code: DWORD); stdcall;
+    procedure Close; stdcall;
+    property IsActived: Boolean read GetIsActived write SetIsActived;
+  end;
 
   TContextOptions = set of (coDisableZip,       // 不需要服务等压缩数据
                             coDumpResponseData  // 丢弃返回值, 只要状态码
@@ -46,6 +60,10 @@ type
   // HTTP 请求上下文
   THttpContext = class
   private
+    FCloseCount: Integer;
+    {$ifdef Debug}
+    FDebugID: Cardinal;
+    {$endif}
     FOwner: TObject;
     FSender: TObject;
     FRequestHandle: HINTERNET;
@@ -55,17 +73,15 @@ type
     FIsHttps: boolean;
     FOptions : TContextOptions;
 
-    FInData: RawByteString;
-    FInDataLength: DWORD;
-
     FBuffer: RawByteString;
     FBufferSize: DWORD;
     FDownloadChunkSize: DWORD;  // 下载代码块长度
     // response Data
     FCode: DWORD;
     FEncoding :RawByteString;
+
     FOutDataLength: DWORD;
-    FResponseData: TStream;
+    FResponseTmpData: TStream;
     FResponseReadSize: DWORD;   // 读取总长度
 
     // 最后的错误信息
@@ -73,15 +89,18 @@ type
     FErrorMsg: string;
     FTickCount: Cardinal;       // 不精确的消耗计时
 
-    FOnFinshed: TNotifyEvent;
-    FResponseDataFun: TResponseDataFun;
 
+    FOnFinshed: TNotifyEvent;
+    FDatas: TDataRequest;
+
+    procedure InitBuff;
     function  InternalGetInfo(Info: DWORD): RawByteString;
     function  InternalGetInfo32(Info: DWORD): DWORD;
     function  GetOutDataLength: DWORD;
     function  SetOption(AOpt, AFlags: DWORD): Boolean;
     function  AddHeader(const Data: string): boolean;
     procedure WriteLastError;
+    procedure SetDatas(const Value: TDataRequest);
   protected
     fOnDownload: TWinHttpDownload;
     fOnProgress: TWinHttpProgress;
@@ -96,18 +115,17 @@ type
     procedure DoHeadersAvailable(dwStatusInformationLength: DWORD);
     procedure DoDataAvailable(lpvStatusInformation: LPVOID);
     procedure DoReadComplete(lpvStatusInformation: LPVOID; dwStatusInformationLength: DWORD);
+    function  DoRequest: Cardinal;
     procedure DoRequestError(lpvStatusInformation: LPWINHTTP_ASYNC_RESULT);
     procedure DoResponseData;
     function IsHttps: Boolean;
+    function  IsCancel: Boolean;
   public
-    UserData: string;
-
     constructor Create(AOwner: TObject); virtual;
     destructor Destroy; override;
 
-    procedure SetInData(const AData: String);
     procedure CloseRequst;
-    function Request(AFun: TResponseDataFun = nil): Integer;
+    function Request: Integer;
 
     property API: string read FAPI write FAPI;
     property Method: string read FMethod write FMethod;
@@ -118,11 +136,8 @@ type
     property ErrorMsg: string read FErrorMsg write FErrorMsg;
 
     property DownloadChunkSize: DWORD read FDownloadChunkSize write FDownloadChunkSize;
-    property InDataLength: DWORD read FInDataLength;
-    property ResponseLength: DWORD read GetOutDataLength;
-    property RequestTickCount: Cardinal read FTickCount;
     property Code: DWORD read FCode;
-    property OutData: TStream read FResponseData;
+    property Datas: TDataRequest read FDatas write SetDatas;
     property OnDownload: TWinHttpDownload read fOnDownload write fOnDownload;
     property OnFinshed: TNotifyEvent read FOnFinshed write FOnFinshed;
     property OnProgress: TWinHttpProgress read fOnProgress write fOnProgress;
@@ -132,6 +147,7 @@ type
   THttpConnection = class
   private
     FOwner: TObject;
+    function GetParams: PConnectParams;
   protected
     FContextList: TList;
     FParams: TConnectParams;
@@ -139,13 +155,12 @@ type
   public
     constructor Create(AOwner: TObject; const AParams: TConnectParams); virtual;
     destructor Destroy; override;
-    function BuildContext(Sender: TObject; const API, AMethod: string):
-        THttpContext; virtual;
-    function Async(Sender: TObject; API, Method: string; AParams, AContext: string;
-        AFun: TResponseDataFun; AOptions: TContextOptions = []): Boolean;
-    function Await(Sender: TObject; API, Method: string; AParams, AContext: string;
-        AFun: TResponseDataFun; AOptions: TContextOptions = []): Boolean;
-
+    function BuildContext(Sender: TObject; const API, AMethod: string): THttpContext; virtual;
+    function Async(Sender: TObject; API, Method: string; AData: TDataRequest;
+        AOptions: TContextOptions = []): Boolean;
+    function Await(Sender: TObject; const API, Method: string;
+        AData: TDataRequest; AOptions: TContextOptions = []): Boolean; overload;
+    property Params: PConnectParams read GetParams;
   end;
 
   THttpConnectionClass = class of THttpConnection;
@@ -156,7 +171,6 @@ type
   THttpRequestContext = class(THttpContext)
   protected
   public
-    destructor Destroy; override;
   end;
   // WinHttp API
   TWinHttpConnection = class(THttpConnection)
@@ -174,7 +188,6 @@ type
 
   function GetHttpConnecitonClass: THttpConnectionClass;
 
-
 implementation
 
 uses
@@ -183,25 +196,36 @@ uses
 type
   TWorkThread = class(TThread)
   private
+    FContext: THttpContext;
     FCallback: TResponseDataFun;
     FFinished: Boolean;
-    FContext: THttpContext;
+    FWaitCount: Cardinal;
+    FAPI: string;
+    FParams: RawByteString;
+    FRequestID: TRequestHandle;
+    FLoading: boolean;
     procedure DoCallbackFun;
-    function DoOnRequestFinished: TNotifyEvent;
   protected
     constructor Create(AContext: THttpContext; ACall: TResponseDataFun);
     procedure Execute; override;
   end;
 
-
 var
   OSVersionInfo: TOSVersionInfoEx;
   LogOutLevel: Integer = MAXWORD;
+  MaxRequestID: Cardinal = 0;
+  FResponseList: TList = nil;
+  Mutex :TMutex = nil;
+  {$ifdef debug}
+  _MaxDebugID: cardinal = 0;
+  {$endif}
 
 procedure WriteLog(ALevel: TLogWriteKind; const s: string); overload;
 begin
-  if ord(ALevel) < LogOutLevel then
-    LogWriter.Add(ALevel, s);
+  //if ord(ALevel) < LogOutLevel then
+  //  LogWriter.Add(ALevel, s);
+  //OutputDebugString(Pchar(s));
+  Writeln(Pchar(s));
 end;
 
 procedure WriteLog(ALevel: TLogWriteKind; const Fmt: string; const args: array of const); overload;
@@ -315,38 +339,47 @@ begin
   inherited;
 end;
 
-function THttpConnection.Async(Sender: TObject; API, Method: string; AParams,
-    AContext: string; AFun: TResponseDataFun; AOptions: TContextOptions = []):
-    Boolean;
+function THttpConnection.GetParams: PConnectParams;
+begin
+  Result := @FParams;
+end;
+
+function THttpConnection.Async(Sender: TObject; API, Method: string;
+    AData: TDataRequest; AOptions: TContextOptions = []): Boolean;
 var
   cContext: THttpContext;
 begin
   // 异步处理请求
   cContext := BuildContext(Sender, API, Method);
-  cContext.SetInData(AParams);
-  cContext.UserData := AContext;
+  cContext.Datas := AData;
   cContext.FOptions := AOptions;
-  Result := cContext.Request(AFun) = ID_OK;
+  Result := cContext.Request = ID_OK;
 end;
 
-function THttpConnection.Await(Sender: TObject; API, Method: string; AParams, AContext: string;
-    AFun: TResponseDataFun; AOptions: TContextOptions = []): Boolean;
+function THttpConnection.Await(Sender: TObject; const API, Method: string;
+    AData: TDataRequest; AOptions: TContextOptions = []): Boolean;
 var
   cContext: THttpContext;
   cWorkThread: TWorkThread;
 begin
   // 异步处理请求
   cContext := BuildContext(Sender, API, Method);
-  cContext.SetInData(AParams);
-  cContext.UserData := AContext;
+  cContext.Datas := AData;
   cContext.FOptions := AOptions;
-  cWorkThread := TWorkThread.Create(cContext, AFun);
+//  cContext.FIsAutoFree := False;
+
+  // 使用同步等待线程
+  cWorkThread := TWorkThread.Create(cContext, nil);
+  cWorkThread.FAPI := API;
+
   cWorkThread.Start;
   cWorkThread.WaitFor;
   cWorkThread.Free;
 
+
   Result := True;
 end;
+
 
 function THttpConnection.BuildContext(Sender: TObject; const API, AMethod:
     string): THttpContext;
@@ -356,8 +389,7 @@ end;
 
 { TWinHttpConnection }
 
-function TWinHttpConnection.BuildContext(Sender: TObject; const API,
-  AMethod: string): THttpContext;
+function TWinHttpConnection.BuildContext(Sender: TObject; const API, AMethod: string): THttpContext;
 begin
   Result := THttpRequestContext.Create(Self);
   Result.FIsHttps := FParams.IsHttps;
@@ -432,8 +464,15 @@ begin
   if dwContext = 0 then Exit;
   cContext := THttpContext(dwContext);
 
+  {$ifdef debug}
+  WriteLog(lkDebug, 'Request Callback %3d %d $%0.8X %s', [cContext.FDebugID,
+      cContext.FCloseCount,
+      dwInternetStatus, GetCallbackName(dwInternetStatus)]);
+  {$endif}
 
-  WriteLog(lkDebug, 'Request Callback $%0.8X %s', [dwInternetStatus, GetCallbackName(dwInternetStatus)]);
+  if cContext.FCloseCount > 0 then
+    Exit;
+
   case dwInternetStatus of
     WINHTTP_CALLBACK_STATUS_SENDREQUEST_COMPLETE,
     WINHTTP_CALLBACK_STATUS_WRITE_COMPLETE:
@@ -444,10 +483,8 @@ begin
       cContext.DoDataAvailable(lpvStatusInformation);
     WINHTTP_CALLBACK_STATUS_READ_COMPLETE:
       cContext.DoReadComplete(lpvStatusInformation, dwStatusInformationLength);
-    WINHTTP_CALLBACK_STATUS_REDIRECT:
-      WriteLog(lkDebug, '  REDIRECT (%d)', [dwStatusInformationLength]);
+    //WINHTTP_CALLBACK_STATUS_REDIRECT:;
     //WINHTTP_CALLBACK_STATUS_CLOSE_COMPLETE:;
-      //cContext.OnHandleClosing(hInternet);
     WINHTTP_CALLBACK_STATUS_REQUEST_ERROR:
       cContext.DoRequestError(LPWINHTTP_ASYNC_RESULT(lpvStatusInformation));
   end;
@@ -531,6 +568,13 @@ procedure THttpContext.CloseRequst;
 var
   cReqHandle: HINTERNET;
 begin
+{$ifdef debug}
+  writeln(format('THttpContext %3d - %d CloseRequst', [FDebugID, FCloseCount+1]));
+{$endif}
+
+  inc(FCloseCount);
+  if FCloseCount > 1 then
+    Exit;
   if Assigned(FRequestHandle) then
   begin
     cReqHandle := FRequestHandle;
@@ -539,30 +583,52 @@ begin
     WinHttpAPI.SetStatusCallback(cReqHandle, nil, 0, 0);
     WinHttpAPI.CloseHandle(cReqHandle);
     FTickCount := GetTickCount - FTickCount;
-
-    DoResponseData;
-
-    Free;
   end;
+  DoResponseData;
+  Free;
 end;
 
 constructor THttpContext.Create(AOwner: TObject);
 begin
+  {$ifdef debug}
+  inc(_MaxDebugID);
+  FDebugID := _MaxDebugID;
+  {$endif}
   FCode := 0;
   FOwner := AOwner;
   FResponseReadSize := 0;
   if Assigned(FOwner) and (FOwner is THttpConnection) then
     THttpConnection(FOwner).FContextList.Add(Self);
+
+  {$ifdef Debug}
+    Writeln(format('THttpContext %3d Create', [_MaxDebugID]));
+  {$endif}
+
 end;
 
 destructor THttpContext.Destroy;
 begin
+  {$ifdef Debug}
+    Writeln(format('THttpContext %3d Destroy', [_MaxDebugID]));
+  {$endif}
+
   if Assigned(FOwner) and (FOwner is THttpConnection) then
     THttpConnection(FOwner).FContextList.Remove(Self);
 
-  CloseRequst;
-  if Assigned(FResponseData) then
-    FResponseData.Free;
+  if Assigned(FRequestHandle) then
+  begin
+    WinHttpAPI.SetStatusCallback(FRequestHandle, nil, 0, 0);
+    WinHttpAPI.CloseHandle(FRequestHandle);
+  end;
+
+  if Assigned(FResponseTmpData) then
+    FResponseTmpData.Free;
+
+  if Assigned(FDatas) then
+  begin
+    FDatas.DecRef;
+    FDatas := nil;
+  end;
   inherited;
 end;
 
@@ -599,16 +665,24 @@ end;
 
 procedure THttpContext.PushBuffer(Buffer: Pointer; Size: DWORD);
 begin
-  if not Assigned(FResponseData) then
-      FResponseData := TMemoryStream.Create;
-  FResponseData.Write(buffer^, Size);
-  FResponseReadSize := FResponseReadSize + Size;
-end;
+  // 对于没有压缩的数据直接放到目标流中
+  if FEncoding = '' then
+  begin
+    FDatas.WriteData(buffer, Size);
+  end
+  else
+  begin
+    if not Assigned(FResponseTmpData) then
+        FResponseTmpData := TMemoryStream.Create;
+    FResponseTmpData.Write(buffer^, Size);
+  end;
 
-procedure THttpContext.SetInData(const AData: String);
-begin
-  FInData := UTF8Encode(AData);
-  FInDataLength := Length(FInData);
+  FResponseReadSize := FResponseReadSize + Size;
+
+  if Assigned(FDatas) then
+    FDatas.Progress(FResponseReadSize, FOutDataLength);
+
+  WriteLog(lkDebug, 'PushBuffer %x  size: %d/%d', [integer(self), FResponseReadSize, FOutDataLength]);
 end;
 
 procedure THttpContext.WriteLastRequestError;
@@ -622,6 +696,7 @@ begin
     FLastError := ERROR_BAD_NET_RESP;
     FErrorMsg := 'Undefined error';
   end;
+
 end;
 
 function THttpContext.QueryData: boolean;
@@ -636,86 +711,20 @@ var
   iBytes: DWORD;
 begin
   if FBufferSize = 0 then
-  begin
-    iBytes := DownloadChunkSize;
-    if iBytes <= 0 then iBytes := 65536; // 64KB
-    SetLength(FBuffer, iBytes);
-    FBufferSize := iBytes;
-  end;
+    InitBuff;
 
   Result := WinHttpAPI.ReadData(FRequestHandle, @PByteArray(FBuffer)[0], FBufferSize, nil);
   if not Result then
     WriteLastRequestError;
 end;
 
-function THttpContext.Request(AFun: TResponseDataFun): Integer;
-const
-  ALL_ACCEPT: array[0..1] of PWideChar = ('*/*',nil);
-  IGNRECERTOPTS = SECURITY_FLAG_IGNORE_UNKNOWN_CA or
-                  SECURITY_FLAG_IGNORE_CERT_DATE_INVALID or
-                  SECURITY_FLAG_IGNORE_CERT_CN_INVALID or
-                  SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
-var
-  iFlags: DWORD;
-  pCallback: TWinHttpStatusCallback;
-  CallbackRes: PtrInt absolute pCallback;
-  iDataLen: DWORD;
-  sHeader: String;
+function THttpContext.Request: Integer;
 begin
-  FResponseDataFun := AFun;
-  Result := ERROR_WINHTTP_INVALID_URL;
-  if (API = '') or (Method = '') then
-    Exit;
-
-  FTickCount := GetTickCount;
-  try
-    // options for a true RESTful request
-    iFlags := WINHTTP_FLAG_REFRESH;
-    if FIsHttps then
-      iFlags := iFlags or WINHTTP_FLAG_SECURE;
-
-    FRequestHandle := WinHttpAPI.OpenRequest(TWinHttpConnection(Owner).FConnection,
-                  PChar(Method), PChar(API), nil, nil, @ALL_ACCEPT, iFlags);
-    if not Assigned(FRequestHandle) then
-      Exit;
-
-    // callback set
-    pCallback := WinHttpAPI.SetStatusCallback(FRequestHandle,
-                    WinHTTPRequestCallback,
-                    WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS, 0);
-    if WINHTTP_INVALID_STATUS_CALLBACK = CallbackRes then
-      Exit;
-
-
-    //if FKeepAlive = 0 then
-    //  SetOption(cRequest, WINHTTP_OPTION_DISABLE_FEATURE, WINHTTP_DISABLE_KEEP_ALIVE);
-
-    // SSL ignore certificates
-    if iFlags and WINHTTP_FLAG_SECURE = WINHTTP_FLAG_SECURE then
-    begin
-      if not SetOption(WINHTTP_OPTION_SECURITY_FLAGS, IGNRECERTOPTS) then
-        Exit;
-    end;
-
-    if FOptions * [coDisableZip] = [] then
-      if not AddHeader('Accept-Encoding: gzip') then
-        Exit;
-    if not AddHeader('Content-Type: application/json; charset=utf-8') then
-      Exit;
-
-    if WinHttpAPI.SendRequest(FRequestHandle, nil, 0,
-            Pointer(FInData), FInDataLength, FInDataLength,
-            DWORD_PTR(Pointer(Self))) then
-      Result := S_OK;
-
-  finally
-    if (Result <> S_OK) and Assigned(FRequestHandle) then
-    begin
-      WriteLastError;
-      WinHttpAPI.SetStatusCallback(FRequestHandle, nil, 0, 0);
-      WinHttpAPI.CloseHandle(FRequestHandle);
-      FTickCount := GetTickCount - FTickCount;
-    end;
+  Result := integer(DoRequest);
+  if Result <> S_OK then
+  begin
+    WriteLastError;
+    CloseRequst;
   end;
 end;
 
@@ -723,31 +732,26 @@ procedure THttpContext.ConvertRequestBuffer;
 var
   cData: TMemoryStream;
   cSource :TStream;
+  iReadSize: Integer;
 begin
   // 转换接收的缓存数据
   // GZIP, BR
   if FEncoding = 'gzip' then
   begin
-    if Assigned(FResponseData) then
+    if Assigned(FResponseTmpData) then
     begin
-      cSource := FResponseData;
-      cData := TMemoryStream.Create;
-      try
-        GZReadToStream(cSource, cData);
-        FResponseData.Free;
-        FResponseData := cData;
-      except on E:Exception do
-        cData.Free;
-      end;
+      GZReadToStream(FResponseTmpData, FDatas.OutData);
+      FreeAndNil(FResponseTmpData);
     end;
   end;
-
 end;
 
 procedure THttpContext.DoSendRequestComplete(dwStatusInformationLength: DWORD);
 begin
 	// 准备接收请求响应
-  if not WinHttpAPI.ReceiveResponse(FRequestHandle, nil) then
+  if (FDatas.States * [drsCancel] <> []) then
+    CloseRequst
+  else if not WinHttpAPI.ReceiveResponse(FRequestHandle, nil) then
   begin
     WriteLastRequestError;
     CloseRequst;
@@ -756,43 +760,59 @@ end;
 
 procedure THttpContext.DoHeadersAvailable(dwStatusInformationLength: DWORD);
 begin
-  FCode := InternalGetInfo32(WINHTTP_QUERY_STATUS_CODE);
-  if (FOptions * [coDumpResponseData] = []) then
+  if (FDatas.States * [drsCancel] <> [])  then
   begin
-    //FHeader := InternalGetInfo(WINHTTP_QUERY_RAW_HEADERS_CRLF);
-    FEncoding := InternalGetInfo(WINHTTP_QUERY_CONTENT_ENCODING);
-    //FAcceptEncoding := InternalGetInfo(WINHTTP_QUERY_ACCEPT_ENCODING);
-    FOutDataLength := InternalGetInfo32(WINHTTP_QUERY_CONTENT_LENGTH);
-    //FContentType := InternalGetInfo(WINHTTP_QUERY_CONTENT_TYPE);
-
-    // 读取数据
-    if FCode = HTTP_STATUS_OK then
+    CloseRequst;
+  end
+  else
+  begin
+    FCode := InternalGetInfo32(WINHTTP_QUERY_STATUS_CODE);
+    if (FOptions * [coDumpResponseData] = []) then
     begin
-      if not QueryData then
+      WriteLog(lkDebug, UTF8ToString(InternalGetInfo(WINHTTP_QUERY_RAW_HEADERS_CRLF)));
+      FEncoding := InternalGetInfo(WINHTTP_QUERY_CONTENT_ENCODING);
+      //FAcceptEncoding := InternalGetInfo(WINHTTP_QUERY_ACCEPT_ENCODING);
+      FOutDataLength := InternalGetInfo32(WINHTTP_QUERY_CONTENT_LENGTH);
+      //FContentType := InternalGetInfo(WINHTTP_QUERY_CONTENT_TYPE);
+
+      // 读取数据
+      if (FCode = HTTP_STATUS_OK)  then
+      begin
+        if not QueryData then
+          CloseRequst;
+      end
+      else
         CloseRequst;
     end
     else
       CloseRequst;
-  end
-  else
-    CloseRequst;
+  end;
+
+  //WriteLog(lkDebug, 'readheader %x  size: %d', [integer(self), FOutDataLength]);
 end;
 
 procedure THttpContext.DoDataAvailable(lpvStatusInformation: LPVOID);
 var
   iSize: DWORD;
 begin
-  iSize := LPDWORD(lpvStatusInformation)^;
-  // iSize = 0 数据接收完成
-	if (iSize > 0) then
+  if (FDatas.States * [drsCancel] <> []) then
   begin
-    if not ReadData(iSize) then
-      CloseRequst;
+    CloseRequst;
   end
   else
   begin
-    ConvertRequestBuffer;
-    CloseRequst;
+    iSize := LPDWORD(lpvStatusInformation)^;
+    // iSize = 0 数据接收完成
+    if (iSize > 0) then
+    begin
+      if not ReadData(iSize) then
+        CloseRequst;
+    end
+    else
+    begin
+      ConvertRequestBuffer;
+      CloseRequst;
+    end;
   end;
 end;
 
@@ -823,10 +843,15 @@ end;
 
 procedure THttpContext.DoResponseData;
 begin
-  if assigned(FResponseDataFun) then
-    FResponseDataFun(Self, FCode);
-  if Assigned(FOnFinshed) then
-    FOnFinshed(Self);
+  if Assigned(FDatas) then
+  begin
+    FDatas.FinishRequest(FCode);
+    if Assigned(FOnFinshed) then
+      FOnFinshed(Self);
+
+    FDatas.DecRef;
+    FDatas := nil;
+  end;
 end;
 
 function THttpContext.GetOutDataLength: DWORD;
@@ -834,6 +859,13 @@ begin
   Result := FOutDataLength;
   if Result = 0 then
     Result := FResponseReadSize;
+end;
+
+function THttpContext.IsCancel: Boolean;
+begin
+  Result := (FCloseCount > 0) or
+             not Assigned(FDatas) or
+             (FDatas.States * [drsCancel] <> []);
 end;
 
 function THttpContext.IsHttps: Boolean;
@@ -848,6 +880,15 @@ begin
     ErrorMsg := Format('%s error %d (%s)', [ClassName,LastError, SysErrorMessagePerModule(LastError, WinHttpDll)])
   else
     ErrorMsg := Format('Undefined %s error',[WinHttpDll]);
+end;
+
+procedure THttpContext.SetDatas(const Value: TDataRequest);
+begin
+  assert(FDatas = nil, 'SetDatas 有多处赋值请求数据设置 ');
+
+  FDatas := Value;
+  if Assigned(FDatas) then
+    FDatas.AddRef;
 end;
 
 function THttpContext.SetOption(AOpt, AFlags: DWORD): Boolean;
@@ -866,49 +907,181 @@ begin
 end;
 
 
-{ THttpRequestContext }
 
-destructor THttpRequestContext.Destroy;
+function THttpContext.DoRequest: Cardinal;
+const
+  ALL_ACCEPT: array[0..1] of PWideChar = ('*/*',nil);
+  IGNRECERTOPTS = SECURITY_FLAG_IGNORE_UNKNOWN_CA or
+                  SECURITY_FLAG_IGNORE_CERT_DATE_INVALID or
+                  SECURITY_FLAG_IGNORE_CERT_CN_INVALID or
+                  SECURITY_FLAG_IGNORE_CERT_WRONG_USAGE;
+//var
+//  iFlags: DWORD;
+//  pCallback: TWinHttpStatusCallback;
+//  CallbackRes: PtrInt absolute pCallback;
+//  iDataLen: DWORD;
+//  sHeader: String;
+var
+  bSended: Boolean;
+  iFlags: DWORD;
+  pCallback: TWinHttpStatusCallback;
+  CallbackRes: PtrInt absolute pCallback;
+  iBufLen, iBytesWritten: DWORD;
+  iCurrent: DWORD;
+  L: DWORD;
+  pBuf: Pointer;
 begin
-  TWinHttpConnection(Owner).InternetCloseHandle(FRequestHandle);
-  inherited;
+  Result := ERROR_WINHTTP_INVALID_URL;
+  if (API = '') or (Method = '') then
+    Exit;
+
+  // options for a true RESTful request
+  iFlags := WINHTTP_FLAG_REFRESH;
+  if FIsHttps then
+    iFlags := iFlags or WINHTTP_FLAG_SECURE;
+
+
+  FRequestHandle := WinHttpAPI.OpenRequest(TWinHttpConnection(Owner).FConnection,
+                PChar(Method), PChar(API), nil, nil, @ALL_ACCEPT, iFlags);
+  if not Assigned(FRequestHandle) then
+    Exit;
+    // callback set
+  pCallback := WinHttpAPI.SetStatusCallback(FRequestHandle,
+                  WinHTTPRequestCallback,
+                  WINHTTP_CALLBACK_FLAG_ALL_NOTIFICATIONS, 0);
+  if WINHTTP_INVALID_STATUS_CALLBACK = CallbackRes then
+    Exit;
+
+  //if FKeepAlive = 0 then
+  //  SetOption(cRequest, WINHTTP_OPTION_DISABLE_FEATURE, WINHTTP_DISABLE_KEEP_ALIVE);
+
+  // SSL ignore certificates
+  if iFlags and WINHTTP_FLAG_SECURE = WINHTTP_FLAG_SECURE then
+  begin
+    if not SetOption(WINHTTP_OPTION_SECURITY_FLAGS, IGNRECERTOPTS) then
+      Exit;
+  end;
+
+  if FOptions * [coDisableZip] = [] then
+    if not AddHeader('Accept-Encoding: gzip') then
+      Exit;
+  if not AddHeader('Content-Type: application/json; charset=utf-8') then
+    Exit;
+
+  // Send request
+  bSended := False;
+  InitBuff;
+  pBuf :=  @PByteArray(FBuffer)[0];
+
+  L := DWORD(FDatas.PrepareData);
+  if L <= FBufferSize then
+  begin
+
+    iBufLen := FDatas.ReadParams(pBuf^, FBufferSize);
+    bSended :=  WinHttpAPI.SendRequest(FRequestHandle, nil,0,
+                    pBuf,iBufLen,iBufLen,
+                    DWORD_PTR(Pointer(Self)));
+  end
+  else
+  begin
+    bSended  :=  WinHttpAPI.SendRequest(FRequestHandle,nil,0,nil,0,L,DWORD_PTR(Pointer(Self)));
+    if bSended then
+    begin
+      iCurrent := 0;
+      while iCurrent < L do
+      begin
+        iBufLen := FDatas.ReadParams(pBuf^, FBufferSize);
+        bSended :=WinHttpAPI.WriteData(FRequestHandle, pBuf, iBufLen, @iBytesWritten);
+        if not bSended then
+          Break;
+
+        inc(iCurrent, iBytesWritten);
+        if (FDatas.States * [drsCancel] <> []) or not FOnUpload(Self, iCurrent, L) then
+        begin
+          bSended := False;
+          Break;
+          //raise EWinHTTP.CreateFmt('OnUpload Canceled %s',[aMethod]);
+        end;
+      end;
+    end;
+  end;
+
+  if bSended then
+    Result := S_OK;
 end;
+
+procedure THttpContext.InitBuff;
+var
+  iBytes: DWORD;
+begin
+  if FBufferSize = 0 then
+  begin
+    iBytes := DownloadChunkSize;
+    if iBytes <= 0 then iBytes := 65536; // 64KB
+    SetLength(FBuffer, iBytes);
+    FBufferSize := iBytes;
+  end;
+end;
+
 
 constructor TWorkThread.Create(AContext: THttpContext; ACall: TResponseDataFun);
 begin
+  inherited Create(True);
+  FWaitCount := 0;
   FContext := AContext;
   FCallback := ACall;
-  inherited Create(True);
+  FLoading := True;
 end;
 
 procedure TWorkThread.DoCallbackFun;
-begin
-  if Assigned(FCallback) then
-    FCallback(FContext, FContext.Code);
-end;
-
-function TWorkThread.DoOnRequestFinished: TNotifyEvent;
 begin
 end;
 
 { TWorkThread }
 
 procedure TWorkThread.Execute;
+var
+  res: Cardinal;
+  iCheckRequestCnt: Integer;
 begin
   inherited;
-  FFinished := False;
-  FContext.Request(
-    procedure (Sender: THttpContext; Code: DWORD)
-    begin
-      Synchronize(DoCallbackFun);
-      FFinished := true;
-    end
-  );
+  res := FContext.Request;
 
-  while not FFinished do
-    Sleep(30);
+  if res = S_OK then
+  begin
+    iCheckRequestCnt := 10;
+    Sleep(20);
+    while FLoading and (FWaitCount < 120000) do
+    begin
+      inc(FWaitCount, 20);
+      Sleep(20);
+    end;
+    if FWaitCount > 60000 then
+      LogWriter.Add(lkWarn, '数据等待请求超时 ' + inttostr(FWaitCount));
+  end;
 end;
 
+procedure TConnectParams.Init(const ASvr: string; APort: word; AIsSSL:
+    boolean);
+begin
+  Server := ASvr;
+  Port := APort;
+  IsHttps := AIsSSL;
+  ProxyName:= '';
+  ProxyByPass:= '';
+  ConnectionTimeOut:= 0;
+  SendTimeout:= 0;
+  ReceiveTimeout:= 0;
+end;
+
+
+initialization
+  Mutex :=TMutex.Create;
+  FResponseList := TList.Create;
+
+finalization
+  FResponseList.Free;
+  Mutex.Free;
 end.
 
 
