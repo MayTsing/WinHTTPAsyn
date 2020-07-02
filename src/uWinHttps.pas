@@ -15,12 +15,13 @@ unit uWinHttps;
 interface
 
 uses
-  Classes, SysUtils, Windows, uWinHttpAPI, uDataRequests;
+  Classes, SysUtils, Windows, uWinHttpAPI;
 
 type
+  TDataRequest = class;
+  TDataRequestClass = class of TDataRequest;
   THttpConnection = class;
   THttpContext = class;
-  TRequestHandle = Pointer;
 
   PConnectParams = ^TConnectParams;
   TConnectParams = record
@@ -53,19 +54,24 @@ type
     property IsActived: Boolean read GetIsActived write SetIsActived;
   end;
 
+  THttpObjectStatus = set of (hosFree);
   TContextOptions = set of (coDisableZip,       // 不需要服务等压缩数据
                             coDumpResponseData  // 丢弃返回值, 只要状态码
                             );
 
+  THttpObjectState = set of (hosWriting, hosWrited, hosReading, hosReaded,
+      hosCloseing, hosDestroying, hosFreeNotification);
+  //csLoading ,
+
   // HTTP 请求上下文
   THttpContext = class
   private
-    FCloseCount: Integer;
     {$ifdef Debug}
     FDebugID: Cardinal;
     {$endif}
     FOwner: TObject;
     FSender: TObject;
+    FComponentState: THttpObjectState;
     FRequestHandle: HINTERNET;
 
     FAPI: string;
@@ -87,16 +93,14 @@ type
     // 最后的错误信息
     FLastError: DWORD;
     FErrorMsg: string;
-    FTickCount: Cardinal;       // 不精确的消耗计时
 
-
+    FWaitEvent: THandle;    // 同步信号
     FOnFinshed: TNotifyEvent;
     FDatas: TDataRequest;
 
     procedure InitBuff;
     function  InternalGetInfo(Info: DWORD): RawByteString;
     function  InternalGetInfo32(Info: DWORD): DWORD;
-    function  GetOutDataLength: DWORD;
     function  SetOption(AOpt, AFlags: DWORD): Boolean;
     function  AddHeader(const Data: string): boolean;
     procedure WriteLastError;
@@ -118,7 +122,7 @@ type
     function  DoRequest: Cardinal;
     procedure DoRequestError(lpvStatusInformation: LPWINHTTP_ASYNC_RESULT);
     procedure DoResponseData;
-    function IsHttps: Boolean;
+    function  IsHttps: Boolean;
     function  IsCancel: Boolean;
   public
     constructor Create(AOwner: TObject); virtual;
@@ -142,11 +146,14 @@ type
     property OnFinshed: TNotifyEvent read FOnFinshed write FOnFinshed;
     property OnProgress: TWinHttpProgress read fOnProgress write fOnProgress;
     property OnUpload: TWinHttpUpload read FOnUpload write FOnUpload;
+    property ComponentState: THttpObjectState read FComponentState;
+
   end;
 
   THttpConnection = class
   private
     FOwner: TObject;
+    FComponentState: THttpObjectState;
     function GetParams: PConnectParams;
   protected
     FContextList: TList;
@@ -157,10 +164,12 @@ type
     destructor Destroy; override;
     function BuildContext(Sender: TObject; const API, AMethod: string): THttpContext; virtual;
     function Async(Sender: TObject; API, Method: string; AData: TDataRequest;
-        AOptions: TContextOptions = []): Boolean;
+        AOptions: TContextOptions = []): Boolean; overload;
+    function Async(Sender: TObject; API, Method, AParams: string): Boolean; overload;
     function Await(Sender: TObject; const API, Method: string;
         AData: TDataRequest; AOptions: TContextOptions = []): Boolean; overload;
     property Params: PConnectParams read GetParams;
+    property ComponentState: THttpObjectState read FComponentState;
   end;
 
   THttpConnectionClass = class of THttpConnection;
@@ -186,7 +195,73 @@ type
     function BuildContext(Sender: TObject; const API, AMethod: string): THttpContext; override;
   end;
 
+  TDataRequestProgressEvent = procedure(Sender: TObject; CurrentSize, ContentLength: DWORD) of object;
+  TRequestFinishedEvent = procedure(Sender: TDataRequest; ACode: DWORD) of object;
+
+  TDataRequestStates = set of (drsConnected, drsSendFinished, drsResponeFinished, drsCancel);
+  TDataBuildOptions = set of (dboAutoFree);
+
+  TDataRequest = class
+  private
+    FOwner : TObject;
+    FRefCnt: integer;       // 引用计数自释放
+    FStates: TDataRequestStates;
+    FIsOwnerParam: boolean;
+    FParams: TStream;
+    FIsOwnerData: boolean;
+    FDatas: TStream;
+    FReadFinishedFree: Boolean;
+    FCode: DWORD;
+    FOnProgress: TDataRequestProgressEvent;
+    FOnDownloadFinished: TRequestFinishedEvent;
+    FUserData: string;
+    FErrorMsg: string;
+    FLastError: DWORD;
+    function GetOutData: TStream;
+    function GetOutLength: Int64;
+    procedure SetOutData(const Value: TStream);
+  protected
+    procedure DoDownloadFinished; virtual;
+    function  GetParamsLen: int64; stdcall;
+  public
+    constructor Create(AOwner: TObject); virtual;
+    destructor Destroy; override;
+    procedure AddRef;
+    procedure DecRef;
+    procedure Cancel;
+
+    class procedure Close(var ARequest: TDataRequest); static;
+    class function BuildOf(AClass: TDataRequestClass; AOwner: TObject; const AParams: RawByteString; const AUserData: string;
+                    AFinishedFun: TRequestFinishedEvent; AOpts: TDataBuildOptions = []): TDataRequest;
+    class function Build(AOwner: TObject; const AParams: RawByteString; const AUserData: string;
+                    AFinishedFun: TRequestFinishedEvent; AOpts: TDataBuildOptions = []): TDataRequest; overload; static;
+    class function Build(AOwner: TObject; const AParams: RawByteString; const AUserData: string;
+                    AOpts: TDataBuildOptions = []): TDataRequest; overload; static;
+    class function Build(AOwner: TObject; const AParams: RawByteString; AOpts: TDataBuildOptions): TDataRequest; overload; static;
+    class function Build(AOwner: TObject; const AParams, AOutData: TStream; AOpts: TDataBuildOptions = []): TDataRequest; overload; static;
+
+    function  PrepareData: Int64;
+    procedure FinishRequest(ACode:DWORD);
+    procedure Progress(Size, ContentLength: DWORD); stdcall;
+    procedure SetParams(const s: RawByteString); overload;
+    procedure SetParams(s: TStream); overload;
+    function  ReadParams(var Buffer; Count: Longint): Longint;  stdcall;
+    procedure WriteData(Buffer: Pointer; Size: DWORD); stdcall;
+    function  OutText: RawByteString;
+    property  ParamsLen: int64 read GetParamsLen;
+    property  OnProgress: TDataRequestProgressEvent read FOnProgress write FOnProgress;
+    property  OnDownloadFinished: TRequestFinishedEvent read FOnDownloadFinished write FOnDownloadFinished;
+    property  Code: DWORD read FCode write FCode;
+    property  OutData: TStream read GetOutData write SetOutData;
+    property  OutLength: Int64 read GetOutLength;
+    property  UserData: string read FUserData write FUserData;
+    property  States: TDataRequestStates read FStates;
+    property  LastError: DWORD read FLastError;
+    property  ErrorMsg: string read FErrorMsg;
+  end;
+
   function GetHttpConnecitonClass: THttpConnectionClass;
+
 
 implementation
 
@@ -197,16 +272,12 @@ type
   TWorkThread = class(TThread)
   private
     FContext: THttpContext;
-    FCallback: TResponseDataFun;
-    FFinished: Boolean;
     FWaitCount: Cardinal;
     FAPI: string;
-    FParams: RawByteString;
-    FRequestID: TRequestHandle;
     FLoading: boolean;
-    procedure DoCallbackFun;
+    FWaitEvent: THandle;
   protected
-    constructor Create(AContext: THttpContext; ACall: TResponseDataFun);
+    constructor Create(AContext: THttpContext);
     procedure Execute; override;
   end;
 
@@ -220,12 +291,29 @@ var
   _MaxDebugID: cardinal = 0;
   {$endif}
 
+
+function InterlockedIncrement(var Addend: Integer): Integer;
+asm
+      MOV   EDX,1
+      XCHG  EAX,EDX
+ LOCK XADD  [EDX],EAX
+      INC   EAX
+end;
+
+function InterlockedDecrement(var Addend: Integer): Integer;
+asm
+      MOV   EDX,-1
+      XCHG  EAX,EDX
+ LOCK XADD  [EDX],EAX
+      DEC   EAX
+end;
+
 procedure WriteLog(ALevel: TLogWriteKind; const s: string); overload;
 begin
-  //if ord(ALevel) < LogOutLevel then
-  //  LogWriter.Add(ALevel, s);
+  if ord(ALevel) < LogOutLevel then
+    LogWriter.Add(ALevel, s);
   //OutputDebugString(Pchar(s));
-  Writeln(Pchar(s));
+  //Writeln(Pchar(s));
 end;
 
 procedure WriteLog(ALevel: TLogWriteKind; const Fmt: string; const args: array of const); overload;
@@ -324,16 +412,15 @@ begin
 end;
 
 destructor THttpConnection.Destroy;
-var
-  cObj: TObject;
-  I: Integer;
 begin
-  for I := FContextList.Count - 1 downto 0 do
-  begin
-    cObj := TObject(FContextList[i]);
-    FContextList.Delete(i);
-    cObj.Free;
-  end;
+  Include(FComponentState, hosDestroying);
+  // ContextList 不处理释放问题
+//  for I := FContextList.Count - 1 downto 0 do
+//  begin
+//    cObj := THttpContext(FContextList[i]);
+//    Include(cObj.FComponentState, hosFreeNotification);
+//    FContextList.Delete(i);
+//  end;
 
   FContextList.Free;
   inherited;
@@ -356,26 +443,49 @@ begin
   Result := cContext.Request = ID_OK;
 end;
 
+function THttpConnection.Async(Sender: TObject; API, Method, AParams: string): Boolean;
+begin
+  // 异步执行不返回值
+  //  主要用于写日志之类的操作，不作返回值处理
+  Result := Async(Sender, API, Method,
+        TDataRequest.Build(Sender, UTF8Encode(AParams), [dboAutoFree]),
+        [coDumpResponseData, coDisableZip]);
+end;
+
 function THttpConnection.Await(Sender: TObject; const API, Method: string;
     AData: TDataRequest; AOptions: TContextOptions = []): Boolean;
 var
   cContext: THttpContext;
   cWorkThread: TWorkThread;
+  hEvent: THandle;
 begin
   // 异步处理请求
+  hEvent := CreateEvent(nil, True, False, 'RequestData');
+  if hEvent = 0 then
+  begin
+    WriteLog(lkErr, 'Http Request CreateEvent failed %s', [GetLastError()]);
+    Exit(False);
+  end;
+
+  LogWriter.Add(lkDebug, 'WinHttp Await :' + AData.FOwner.ClassName + ' Method:' + Method + ' URL: ' + API);
+
+  //WriteLog(lkDebug, '1/4 CreateEvent %x', [hEvent]);
   cContext := BuildContext(Sender, API, Method);
   cContext.Datas := AData;
   cContext.FOptions := AOptions;
-//  cContext.FIsAutoFree := False;
+  cContext.FWaitEvent := hEvent;
 
   // 使用同步等待线程
-  cWorkThread := TWorkThread.Create(cContext, nil);
+  cWorkThread := TWorkThread.Create(cContext);
   cWorkThread.FAPI := API;
 
   cWorkThread.Start;
   cWorkThread.WaitFor;
   cWorkThread.Free;
 
+  CloseHandle(hEvent);
+
+  LogWriter.Add(lkDebug, 'WinHttp Await : End ' + API);
 
   Result := True;
 end;
@@ -407,20 +517,14 @@ end;
 
 destructor TWinHttpConnection.Destroy;
 begin
+  Include(FComponentState, hosDestroying);
+
   if Assigned(FSession) then
     WinHttpAPI.SetStatusCallback(FSession, nil, 0, 0); // WinHTTPSecurityErrorCallback
 
   InternetCloseHandle(FConnection);
   InternetCloseHandle(FSession);
   inherited;
-end;
-
-procedure WinHTTPSecurityErrorCallback(hInternet: HINTERNET; dwContext: DWORD_PTR;
-  dwInternetStatus: DWORD; lpvStatusInformation: pointer;
-  dwStatusInformationLength: DWORD); stdcall;
-begin
-  raise EWinHTTP.CreateFmt('WinHTTP security error. Status %d, statusInfo: %d',
-    [dwInternetStatus, pdword(lpvStatusInformation)^]);
 end;
 
 function GetCallbackName(dwInternetStatus: DWORD): string;
@@ -461,16 +565,16 @@ procedure WinHTTPRequestCallback(
 var
   cContext: THttpContext;
 begin
-  if dwContext = 0 then Exit;
-  cContext := THttpContext(dwContext);
-
   {$ifdef debug}
-  WriteLog(lkDebug, 'Request Callback %3d %d $%0.8X %s', [cContext.FDebugID,
-      cContext.FCloseCount,
-      dwInternetStatus, GetCallbackName(dwInternetStatus)]);
+//  WriteLog(lkDebug, 'Request Callback hInternet:%0.8X  dwContext: $%0.8X  state: %6X %s', [
+//      integer(hInternet),
+//      integer(dwContext),
+//      dwInternetStatus, GetCallbackName(dwInternetStatus)]);
   {$endif}
 
-  if cContext.FCloseCount > 0 then
+  if dwContext = 0 then Exit;
+  cContext := THttpContext(dwContext);
+  if cContext.ComponentState * [hosDestroying, hosCloseing] <> [] then
     Exit;
 
   case dwInternetStatus of
@@ -488,7 +592,6 @@ begin
     WINHTTP_CALLBACK_STATUS_REQUEST_ERROR:
       cContext.DoRequestError(LPWINHTTP_ASYNC_RESULT(lpvStatusInformation));
   end;
-
 end;
 
 
@@ -569,23 +672,33 @@ var
   cReqHandle: HINTERNET;
 begin
 {$ifdef debug}
-  writeln(format('THttpContext %3d - %d CloseRequst', [FDebugID, FCloseCount+1]));
+//  WriteLog(lkDebug, format('THttpContext %3d CloseRequst', [FDebugID]));
 {$endif}
-
-  inc(FCloseCount);
-  if FCloseCount > 1 then
+  if ComponentState * [hosCloseing] <> [] then
     Exit;
+
+  Include(FComponentState, hosCloseing);
   if Assigned(FRequestHandle) then
   begin
     cReqHandle := FRequestHandle;
     FRequestHandle := nil;
-
     WinHttpAPI.SetStatusCallback(cReqHandle, nil, 0, 0);
     WinHttpAPI.CloseHandle(cReqHandle);
-    FTickCount := GetTickCount - FTickCount;
   end;
-  DoResponseData;
-  Free;
+
+  if ComponentState * [hosDestroying, hosFreeNotification] = [] then
+    DoResponseData;
+
+  if FWaitEvent <> 0 then
+  begin
+    if not SetEvent(FWaitEvent) then
+      FErrorMsg := Format('SetEvent failed (%d)', [GetLastError()]);
+    //WriteLog(lkDebug, '3/4 SetEvent %x  %x', [FWaitEvent, integer(cReqHandle)]);
+    FWaitEvent := 0;
+  end;
+
+  if ComponentState * [hosDestroying, hosFreeNotification] = [] then
+    Free;
 end;
 
 constructor THttpContext.Create(AOwner: TObject);
@@ -597,32 +710,36 @@ begin
   FCode := 0;
   FOwner := AOwner;
   FResponseReadSize := 0;
+  FWaitEvent := 0;
   if Assigned(FOwner) and (FOwner is THttpConnection) then
     THttpConnection(FOwner).FContextList.Add(Self);
 
-  {$ifdef Debug}
-    Writeln(format('THttpContext %3d Create', [_MaxDebugID]));
-  {$endif}
+//  {$ifdef Debug}
+//    WriteLog(lkDebug, format('THttpContext %3d Create', [_MaxDebugID]));
+//  {$endif}
 
 end;
 
 destructor THttpContext.Destroy;
 begin
-  {$ifdef Debug}
-    Writeln(format('THttpContext %3d Destroy', [_MaxDebugID]));
-  {$endif}
+  Include(FComponentState, hosDestroying);
 
-  if Assigned(FOwner) and (FOwner is THttpConnection) then
-    THttpConnection(FOwner).FContextList.Remove(Self);
+  {$ifdef Debug}
+//    WriteLog(lkDebug , format('THttpContext %3d Destroy', [FDebugID]));
+  {$endif}
+  if (FComponentState * [hosFreeNotification] <> []) and Assigned(FOwner) then
+    if (FOwner is THttpConnection) and (THttpConnection(FOwner).ComponentState * [hosDestroying] = []) then
+      THttpConnection(FOwner).FContextList.Remove(Self);
 
   if Assigned(FRequestHandle) then
   begin
     WinHttpAPI.SetStatusCallback(FRequestHandle, nil, 0, 0);
     WinHttpAPI.CloseHandle(FRequestHandle);
+    FRequestHandle := nil;
   end;
 
   if Assigned(FResponseTmpData) then
-    FResponseTmpData.Free;
+    FreeAndNil(FResponseTmpData);
 
   if Assigned(FDatas) then
   begin
@@ -682,7 +799,7 @@ begin
   if Assigned(FDatas) then
     FDatas.Progress(FResponseReadSize, FOutDataLength);
 
-  WriteLog(lkDebug, 'PushBuffer %x  size: %d/%d', [integer(self), FResponseReadSize, FOutDataLength]);
+//  WriteLog(lkDebug, 'PushBuffer %x  size: %d/%d', [integer(self), FResponseReadSize, FOutDataLength]);
 end;
 
 procedure THttpContext.WriteLastRequestError;
@@ -707,8 +824,6 @@ begin
 end;
 
 function THttpContext.ReadData(Size: DWORD): Boolean;
-var
-  iBytes: DWORD;
 begin
   if FBufferSize = 0 then
     InitBuff;
@@ -720,19 +835,18 @@ end;
 
 function THttpContext.Request: Integer;
 begin
+  Include(FComponentState, hosWriting);
   Result := integer(DoRequest);
+  Exclude(FComponentState, hosWriting);
   if Result <> S_OK then
   begin
     WriteLastError;
     CloseRequst;
   end;
+
 end;
 
 procedure THttpContext.ConvertRequestBuffer;
-var
-  cData: TMemoryStream;
-  cSource :TStream;
-  iReadSize: Integer;
 begin
   // 转换接收的缓存数据
   // GZIP, BR
@@ -769,7 +883,7 @@ begin
     FCode := InternalGetInfo32(WINHTTP_QUERY_STATUS_CODE);
     if (FOptions * [coDumpResponseData] = []) then
     begin
-      WriteLog(lkDebug, UTF8ToString(InternalGetInfo(WINHTTP_QUERY_RAW_HEADERS_CRLF)));
+      //WriteLog(lkDebug, UTF8ToString(InternalGetInfo(WINHTTP_QUERY_RAW_HEADERS_CRLF)));
       FEncoding := InternalGetInfo(WINHTTP_QUERY_CONTENT_ENCODING);
       //FAcceptEncoding := InternalGetInfo(WINHTTP_QUERY_ACCEPT_ENCODING);
       FOutDataLength := InternalGetInfo32(WINHTTP_QUERY_CONTENT_LENGTH);
@@ -845,25 +959,19 @@ procedure THttpContext.DoResponseData;
 begin
   if Assigned(FDatas) then
   begin
+    FDatas.FLastError := FLastError;
+    FDatas.FErrorMsg := FErrorMsg;
     FDatas.FinishRequest(FCode);
     if Assigned(FOnFinshed) then
       FOnFinshed(Self);
-
     FDatas.DecRef;
     FDatas := nil;
   end;
 end;
 
-function THttpContext.GetOutDataLength: DWORD;
-begin
-  Result := FOutDataLength;
-  if Result = 0 then
-    Result := FResponseReadSize;
-end;
-
 function THttpContext.IsCancel: Boolean;
 begin
-  Result := (FCloseCount > 0) or
+  Result := (ComponentState * [hosCloseing, hosDestroying, hosFreeNotification] <> []) or
              not Assigned(FDatas) or
              (FDatas.States * [drsCancel] <> []);
 end;
@@ -969,14 +1077,12 @@ begin
     Exit;
 
   // Send request
-  bSended := False;
   InitBuff;
   pBuf :=  @PByteArray(FBuffer)[0];
 
   L := DWORD(FDatas.PrepareData);
   if L <= FBufferSize then
   begin
-
     iBufLen := FDatas.ReadParams(pBuf^, FBufferSize);
     bSended :=  WinHttpAPI.SendRequest(FRequestHandle, nil,0,
                     pBuf,iBufLen,iBufLen,
@@ -1024,41 +1130,31 @@ begin
 end;
 
 
-constructor TWorkThread.Create(AContext: THttpContext; ACall: TResponseDataFun);
+constructor TWorkThread.Create(AContext: THttpContext);
 begin
   inherited Create(True);
   FWaitCount := 0;
   FContext := AContext;
-  FCallback := ACall;
   FLoading := True;
-end;
-
-procedure TWorkThread.DoCallbackFun;
-begin
+  FWaitEvent := FContext.FWaitEvent;
 end;
 
 { TWorkThread }
 
 procedure TWorkThread.Execute;
+const
+  MAXCNT = 120000;
 var
   res: Cardinal;
-  iCheckRequestCnt: Integer;
+  iwait: Cardinal;
 begin
-  inherited;
+  assert(FWaitEvent <> 0, 'Http wait event not create');
+  iWait := WAIT_OBJECT_0;
   res := FContext.Request;
-
   if res = S_OK then
-  begin
-    iCheckRequestCnt := 10;
-    Sleep(20);
-    while FLoading and (FWaitCount < 120000) do
-    begin
-      inc(FWaitCount, 20);
-      Sleep(20);
-    end;
-    if FWaitCount > 60000 then
-      LogWriter.Add(lkWarn, '数据等待请求超时 ' + inttostr(FWaitCount));
-  end;
+    iWait := WaitForSingleObject(FWaitEvent, MAXCNT);
+  if iWait <> WAIT_OBJECT_0 then
+    WriteLog(lkWarn, 'Request http %s Fa' , [FAPI]);
 end;
 
 procedure TConnectParams.Init(const ASvr: string; APort: word; AIsSSL:
@@ -1072,6 +1168,229 @@ begin
   ConnectionTimeOut:= 0;
   SendTimeout:= 0;
   ReceiveTimeout:= 0;
+end;
+
+constructor TDataRequest.Create(AOwner: TObject);
+begin
+  FReadFinishedFree := False;
+  FOwner := AOwner;
+  //FParams:= TStringStream.Create('', TEncoding.UTF8);
+  FIsOwnerParam := False;
+  FIsOwnerData := True;
+  FDatas := TStringStream.Create('', TEncoding.UTF8);
+  {$ifdef Debug}
+  //WriteLog(lkDebug, 'TDataRequest Create');
+  {$endif}
+
+end;
+
+destructor TDataRequest.Destroy;
+begin
+  assert(FRefCnt = 0, '引用计数自释放模式，需要调用DecRef 进行释放。');
+
+  if FIsOwnerParam then
+    FreeAndNil(FParams);
+  if FIsOwnerData then
+    FreeAndNil(FDatas);
+
+  {$ifdef Debug}
+  //WriteLog(lkDebug, format('TDataRequest Destroy %s', [UserData]));
+  {$endif}
+
+  inherited;
+end;
+
+procedure TDataRequest.AddRef;
+begin
+  InterlockedIncrement(FRefCnt);
+  {$ifdef Debug}
+//  Writeln('TDataRequest AddRef ' + intToStr(FRefCnt));
+  {$endif}
+end;
+
+procedure TDataRequest.DecRef;
+begin
+  InterlockedDecrement(FRefCnt);
+  assert(FRefCnt >= 0, '引用计数自释放模式必须同AddRef配合使用');
+
+//  {$ifdef Debug}
+//  Writeln('TDataRequest DecRef ' + intToStr(FRefCnt));
+//  {$endif}
+
+  if FRefCnt = 0 then
+    Free;
+end;
+
+procedure TDataRequest.Cancel;
+begin
+  Include(FStates, drsCancel);
+  {$ifdef Debug}
+//  Writeln('TDataRequest Cancel request');
+  {$endif}
+end;
+
+class procedure TDataRequest.Close(var ARequest: TDataRequest);
+begin
+  if Assigned(ARequest) then
+  begin
+    ARequest.Cancel;
+    ARequest.DecRef;
+    ARequest := nil;
+  end;
+end;
+
+class function TDataRequest.BuildOf(AClass: TDataRequestClass; AOwner: TObject;
+    const AParams: RawByteString; const AUserData: string;
+    AFinishedFun: TRequestFinishedEvent; AOpts: TDataBuildOptions = []): TDataRequest;
+var
+  cData: TDataRequest;
+begin
+  cData := TDataRequest(AClass.NewInstance).Create(AOwner);
+  cData.SetParams(AParams);
+  cData.UserData := AUserData;
+  cData.OnDownloadFinished := AFinishedFun;
+  if AOpts * [dboAutoFree] = [] then
+    cData.AddRef;
+  Result := cData;
+end;
+
+class function TDataRequest.Build(AOwner: TObject; const AParams: RawByteString;
+    const AUserData: string; AFinishedFun: TRequestFinishedEvent;
+    AOpts: TDataBuildOptions): TDataRequest;
+begin
+  ///  创建请求数据对象
+  ///
+  ///  参数： AParams       --- 请求Json参数 UTF8
+  ///         AUserData     --- 用户自定义数据，类似 Tag
+  ///         AFinishedFun  --- 完成请求回调函数
+  ///         IsAutoFree    --- 是否自动释放
+  ///                 True： 请求完成后TDataRequest对象Free自动释放，不需要显示调用关闭
+  ///                 False: 由外部控制释放时机
+  ///
+  Result := TDataRequest.BuildOf(TDataRequest, AOwner, AParams, AUserData, AFinishedFun, AOpts);
+end;
+
+class function TDataRequest.Build(AOwner: TObject; const AParams: RawByteString;
+    const AUserData: string; AOpts: TDataBuildOptions): TDataRequest;
+begin
+  Result := TDataRequest.BuildOf(TDataRequest, AOwner, AParams, AUserData, nil, AOpts);
+end;
+
+class function TDataRequest.Build(AOwner: TObject; const AParams: RawByteString;
+    AOpts: TDataBuildOptions): TDataRequest;
+begin
+  Result := TDataRequest.BuildOf(TDataRequest, AOwner, AParams, '', nil, AOpts);
+end;
+
+class function TDataRequest.Build(AOwner: TObject; const AParams, AOutData: TStream;
+    AOpts: TDataBuildOptions):TDataRequest;
+var
+  cData: TDataRequest;
+begin
+  cData := TDataRequest.Create(AOwner);
+  cData.SetParams(AParams);
+  cData.OutData := AOutData;
+  if AOpts * [dboAutoFree] = [] then
+    cData.AddRef;
+  Result := cData;
+end;
+
+procedure TDataRequest.DoDownloadFinished;
+begin
+  if Assigned(FOnDownloadFinished) then
+    FOnDownloadFinished(Self, FCode);
+end;
+
+procedure TDataRequest.FinishRequest(ACode: DWORD);
+begin
+  FCode := ACode;
+  Include(FStates, drsResponeFinished);
+  if (FStates * [drsCancel] = []) then
+  begin
+    Try
+      DoDownloadFinished;
+    except on E: exception do
+      LogWriter.Err('TDataRequest.FinishRequest', E.ClassName + E.Message);
+    End;
+  end;
+end;
+
+function TDataRequest.GetOutData: TStream;
+begin
+  Result := FDatas;
+end;
+
+function TDataRequest.GetOutLength: Int64;
+begin
+  Result := FDatas.Size;
+end;
+
+function TDataRequest.GetParamsLen: int64;
+begin
+  Result := FParams.Size;
+end;
+
+function TDataRequest.OutText: RawByteString;
+var
+  iLen: Cardinal;
+begin
+  iLen := OutData.Size;
+  if iLen > 0 then
+  begin
+    SetLength(Result, iLen);
+    OutData.Position := 0;
+    OutData.Read(PByteArray(Result)[0], iLen);
+  end
+  else
+    Result := UTF8Encode('{}');
+end;
+
+procedure TDataRequest.Progress(Size, ContentLength: DWORD);
+begin
+  if (FStates * [drsCancel] = []) and Assigned(OnProgress) then
+    OnProgress(Self, Size, ContentLength);
+end;
+
+procedure TDataRequest.SetParams(const s: RawByteString);
+begin
+  if not Assigned(FParams) then
+  begin
+    FIsOwnerParam := True;
+    FParams := TStringStream.Create('', TEncoding.UTF8);
+  end;
+  FParams.Write(PByteArray(s)[0], Length(s));
+end;
+
+procedure TDataRequest.SetParams(s: TStream);
+begin
+  if Assigned(FParams) then
+    FreeAndNil(FParams);
+  FIsOwnerParam := False;
+  FParams := s;
+end;
+
+function TDataRequest.ReadParams(var Buffer; Count: Integer): Longint;
+begin
+  Result := FParams.Read(Buffer, Count);
+end;
+
+function TDataRequest.PrepareData: Int64;
+begin
+  FParams.Position := 0;
+  Result := FParams.Size;
+end;
+
+procedure TDataRequest.SetOutData(const Value: TStream);
+begin
+  if FIsOwnerData and Assigned(FDatas) then
+    FreeAndNil(FDatas);
+  FDatas := Value;
+  FIsOwnerData := False;
+end;
+
+procedure TDataRequest.WriteData(Buffer: Pointer; Size: DWORD);
+begin
+  FDatas.Write(Buffer^, Size);
 end;
 
 
