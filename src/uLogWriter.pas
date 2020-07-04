@@ -1,11 +1,10 @@
 unit uLogWriter;
 
-{$define LogWriter}
 
 interface
 
 type
-  TLogWriteKind = (lkHint, lkWarn, lkErr, lkTick, lkDebug);
+  TLogWriteKind = (lkErr, lkWarn, lkHint, lkTick, lkDebug);
   TLogWriteOptions = set of (lwoTimestamp);
   LogWriter = class
   public
@@ -27,30 +26,46 @@ type
 
 var
   gListOpenTimeCount: cardinal;
+  gLogMsgLevel: Integer = {$ifdef Debug} ord(lkDebug) {$else} ord(lkWarn) {$endif};
+const
+  CONSTNAMES_Kind: array [TLogWriteKind] of string = ('ERROR', 'WARN', 'HINT', 'TICK', 'DEBUG');
 
 implementation
 uses
-  SysUtils, StrUtils, Windows;
+  SysUtils, StrUtils, Windows, untCommFuns;
 
 var
   gTicks: array [0..100] of Cardinal;
   gTickCnt: Integer = 0;
   gWriteCnt: integer = 0;
-  cs:TRTLCriticalSection;
+  cs: TMutex = nil;
+  LogTag: string = '';
+  LogFileName: string = '';
 
 
-const
-  CONSTNAMES_Kind: array [TLogWriteKind] of string = ('HINT', 'WARN', 'ERR', 'TICK', 'DEBUG');
 
+function GetUserPath: string;
+begin
+   Result := ExtractFilePath(ParamStr(0));
+end;
 
 function GetLogFileName(ADate: TDateTime): string;
 var
   sPath: string;
+  sTag :string;
 begin
-  sPath := '.\log\' + FormatDateTime('yyyymm', ADate);
-  Result := sPath + '\' + FormatDateTime('yyyymmdd', ADate) + '.log';
-  if not DirectoryExists(sPath) then
-    ForceDirectories(sPath);
+  sTag := FormatDateTime('yyyymmdd', ADate);
+  if sTag <> LogTag then
+  begin
+    LogTag := sTag;
+    sPath := GetUserPath + 'log\' + FormatDateTime('yyyymm', ADate);
+    LogFileName := sPath + '\' + FormatDateTime('yyyymmdd', ADate) + '.log';
+    if not DirectoryExists(sPath) then
+      if not ForceDirectories(sPath) then
+        LogFileName := '';
+  end;
+
+  Result := LogFileName
 end;
 
 function GetTimestampStr: string;
@@ -66,10 +81,12 @@ var
 {$endif}
 begin
   {$ifdef LogWriter}
-  EnterCriticalSection(cs);
-  try
+  sFileName := GetLogFileName(now);
+  if sFileName = '' then
+    Exit;
 
-    sFileName := GetLogFileName(now);
+  cs.Enter;
+  try
     AssignFile(f, sFileName);
     try
       if FileExists(sFileName) then
@@ -91,7 +108,7 @@ begin
       CloseFile(f);
     end;
   finally
-    LeaveCriticalSection(cs);
+    cs.Leave;
   end;
   {$endif}
 end;
@@ -145,8 +162,10 @@ begin
     gTickCnt := 0;
 
   // level 2 级以上不记录
-  if gTickCnt > 0 then
+  if (gTickCnt > 0) or not (gLogMsgLevel > Ord(lkTick)) then
     Exit;
+
+
 
   cStr := TStringBuilder.Create;
   try
@@ -226,10 +245,14 @@ end;
 class procedure LogWriter.Add(AKind: TLogWriteKind; const s: string;
   AOpts: TLogWriteOptions);
 begin
-  if lwoTimestamp in AOpts  then
-    writelog(format('#%s: %s %s', [CONSTNAMES_Kind[AKind], GetTimestampStr, s]))
-  else
-    writelog(format('#%s: %s', [CONSTNAMES_Kind[AKind], s]))
+  if ord(AKind) <= gLogMsgLevel then
+  begin
+    if lwoTimestamp in AOpts  then
+      writelog(format('#%s: %s %s', [CONSTNAMES_Kind[AKind], GetTimestampStr, s]))
+    else
+      writelog(format('#%s: %s', [CONSTNAMES_Kind[AKind], s]))
+  end;
+
 end;
 
 class procedure LogWriter.AddFmt(AKind:TLogWriteKind; const s: string;
@@ -240,11 +263,11 @@ end;
 
 initialization
   {$ifdef LogWriter}
-  InitializeCriticalSection(cs);
+  cs := TMutex.Create;
   {$endif}
 
 finalization
   {$ifdef LogWriter}
-  DeleteCriticalSection(cs);
+  cs.Free;
   {$endif}
 end.
